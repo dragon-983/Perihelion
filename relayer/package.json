@@ -28,9 +28,9 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "start": "node dist/cli.js",
-    "dev": "tsx watch src/cli.ts",
+    "build": "node init && tsc -p tsconfig.json",
+    "start": "node init && node dist/cli.js",
+    "dev": "node init && tsx watch src/cli.ts",
     "test": "node --test --import tsx test/*.test.ts",
     "test:coverage": "c8 --all --src src --include 'src/**' --exclude 'dist/**' --exclude 'test/**' --reporter=lcov --reporter=text --report-dir=coverage node --test --import tsx test/*.test.ts",
     "clean": "rm -rf dist",
