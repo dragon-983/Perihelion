@@ -216,17 +216,23 @@ test("checkFillStatus: returns filled=false when isSettled returns false", async
   assert.equal(result.settlementTx, undefined);
 });
 
-test("checkFillStatus: returns filled=true with intentHash as marker when isSettled returns true", async () => {
+test("checkFillStatus: returns filled=true with settlementTx when isSettled returns true", async () => {
   const signed = makeSignedIntent();
   class SettledExecutor extends Executor {
     protected override async isSettled(_: Hex): Promise<boolean> {
       return true;
     }
+    protected override async getLock() {
+      return { txHash: "0xrealSettlementTx" as Hex };
+    }
+    protected override async fetchSettlementTxHash() {
+      return "0xfallbackTx" as Hex;
+    }
   }
   const ex = new SettledExecutor(BASE_CONFIG, SILENT_LOGGER) as PrivateExecutor;
   const result = await ex.checkFillStatus(signed.hash);
   assert.equal(result.filled, true);
-  assert.equal(result.settlementTx, signed.hash);
+  assert.equal(result.settlementTx, "0xrealSettlementTx");
 });
 
 test("checkFillStatus: swallows isSettled errors and returns filled=false", async () => {
