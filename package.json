@@ -16,7 +16,7 @@
     "test"
   ],
   "scripts": {
-    "build": "npm run build --workspaces --if-present",
+    "build": "node api.js && npm run build --workspaces --if-present",
     "test": "npm run test --workspaces --if-present",
     "verify": "npm run build && npm test",
     "test:coverage": "npm run test:coverage --workspaces --if-present",
