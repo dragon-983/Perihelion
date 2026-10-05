@@ -18,14 +18,17 @@
  * toSmallestUnits("0.99", 7)
  */
 
+import { PerihelionValidationError } from "./errors.js";
+
 /** Upper bound on `decimals`, generous for any real asset but small enough to rule out unbounded BigInt exponentiation. */
 const MAX_DECIMALS = 36;
 
 /** Reject a `decimals` argument that is not a small non-negative integer. */
 function assertValidDecimals(decimals: number, fn: string): void {
   if (!Number.isInteger(decimals) || decimals < 0 || decimals > MAX_DECIMALS) {
-    throw new Error(
+    throw new PerihelionValidationError(
       `${fn}: decimals must be an integer between 0 and ${MAX_DECIMALS}, got ${decimals}`,
+      "decimals",
     );
   }
 }
@@ -41,14 +44,15 @@ function assertValidDecimals(decimals: number, fn: string): void {
 export function toSmallestUnits(human: string, decimals: number): string {
   assertValidDecimals(decimals, "toSmallestUnits");
   if (!/^\d+(\.\d+)?$/.test(human.trim())) {
-    throw new Error(`toSmallestUnits: invalid amount "${human}"`);
+    throw new PerihelionValidationError(`toSmallestUnits: invalid amount "${human}"`, "human");
   }
   const parts = human.trim().split(".");
   const whole = parts[0] ?? "0";
   const frac = parts[1] ?? "";
   if (frac.length > decimals) {
-    throw new Error(
+    throw new PerihelionValidationError(
       `toSmallestUnits: "${human}" has more than ${decimals} decimal places`,
+      "human",
     );
   }
   const padded = frac.padEnd(decimals, "0");
@@ -74,7 +78,7 @@ export function fromSmallestUnits(smallest: string, decimals: number): string {
   assertValidDecimals(decimals, "fromSmallestUnits");
   const trimmed = smallest.trim();
   if (!/^-?\d+$/.test(trimmed)) {
-    throw new Error(`fromSmallestUnits: invalid amount "${smallest}"`);
+    throw new PerihelionValidationError(`fromSmallestUnits: invalid amount "${smallest}"`, "smallest");
   }
   const negative = trimmed.startsWith("-");
   const abs = negative ? BigInt(trimmed.slice(1)) : BigInt(trimmed);

@@ -1,0 +1,31 @@
+# Labels that automation in this repository applies or checks for.
+#
+# Dependabot silently drops labels that do not exist, and changelog-check.yml
+# looks for `no-changelog`, so each one referenced by .github/dependabot.yml
+# or a workflow must be listed here. .github/workflows/labels.yml creates any
+# that are missing (it never modifies or deletes existing labels).
+
+- name: dependencies
+  color: "0366d6"
+  description: Dependency updates (applied by Dependabot)
+- name: ci
+  color: "ededed"
+  description: CI / GitHub Actions workflows
+- name: docker
+  color: "0db7ed"
+  description: Dockerfile, docker-compose and container images
+- name: no-changelog
+  color: "cfd3d7"
+  description: Exempts a feat/fix PR from the CHANGELOG.md check
+- name: bug
+  color: "d73a4a"
+  description: Something isn't working
+- name: security
+  color: "b60205"
+  description: Security-relevant issue or change
+- name: wire-format
+  color: "5319e7"
+  description: Cross-chain message encoding
+- name: differential-fuzz
+  color: "fbca04"
+  description: Reported by the differential fuzzing workflow

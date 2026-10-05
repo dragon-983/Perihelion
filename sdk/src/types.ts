@@ -86,7 +86,7 @@ export interface SignedIntent {
 
 /** A status record returned by the mempool for a given intent hash. */
 export interface IntentRecord extends SignedIntent {
-  readonly status: IntentStatus;
+  readonly status: MempoolIntentStatus;
   /** Solver that claimed the intent, if any. */
   readonly solver?: Address;
   /** Stellar tx hash of the settlement, once settled. */

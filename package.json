@@ -23,13 +23,19 @@
     "lint": "npm run lint --workspaces --if-present",
     "clean": "npm run clean --workspaces --if-present",
     "fmt": "npm run fmt --workspaces --if-present",
-    "fmt:check": "npm run fmt:check --workspaces --if-present"
+    "fmt:check": "npm run fmt:check --workspaces --if-present",
+    "prepare": "lefthook install"
   },
   "engines": {
     "node": ">=20"
   },
   "devDependencies": {
+    "@stryker-mutator/core": "^8.7.1",
+    "@stryker-mutator/typescript-checker": "^8.7.1",
     "lefthook": "^1.7.0",
     "typescript": "^5.4.0"
+  },
+  "overrides": {
+    "qs": "^6.16.0"
   }
 }

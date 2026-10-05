@@ -17,15 +17,17 @@
         build-all-strict test-all-strict       \
         assert-all-toolchains                  \
         test  test-ts  test-soroban  test-evm  \
+        test-e2e test-e2e-watch                \
         lint  lint-ts  lint-soroban  lint-evm  \
         fmt   fmt-ts   fmt-soroban   fmt-evm   \
-        coverage coverage-ts coverage-evm      \
+        coverage coverage-ts coverage-soroban coverage-evm \
         gas                                    \
         audit audit-ts audit-evm audit-rust    \
         bytecode-check                         \
         clean                                  \
         fuzz fuzz-bounded fuzz-extended fuzz-nightly \
         fuzz-evm fuzz-rust fuzz-cross          \
+        mutation mutation-ts mutation-soroban  \
         clean-corpus                           \
         doctor
 
@@ -52,6 +54,10 @@ help: ## Show available targets
 	@echo ''
 	@echo 'Fuzzing targets:'
 	@grep -E '^fuzz[a-zA-Z_-]*:.*?## ' $(MAKEFILE_LIST) | \
+		awk 'BEGIN {FS = ":.*?## "}; {printf "  %-22s %s\n", $$1, $$2}'
+	@echo ''
+	@echo 'Mutation testing (slow — the nightly CI job runs these same targets):'
+	@grep -E '^mutation[a-zA-Z_-]*:.*?## ' $(MAKEFILE_LIST) | \
 		awk 'BEGIN {FS = ":.*?## "}; {printf "  %-22s %s\n", $$1, $$2}'
 	@echo ''
 	@echo 'Diagnostics:'
@@ -114,7 +120,7 @@ build-all-strict: assert-all-toolchains ## Build all stacks; FAILS if any toolch
 # TEST
 # ─────────────────────────────────────────────────────────────────────────────
 
-test: test-ts test-soroban test-evm ## Run all test suites (skips a stack if its toolchain is missing)
+test: test-ts test-soroban test-evm test-e2e ## Run all test suites (skips a stack if its toolchain is missing)
 
 test-ts: ## Run TypeScript tests (sdk, solver, relayer, mempool)
 	@echo "▶ test-ts"
@@ -138,7 +144,7 @@ test-evm: ## Run EVM Solidity tests (Foundry)
 
 test-all-strict: assert-all-toolchains ## Run all test suites; FAILS if any toolchain is missing (CI use)
 	@echo "▶ test-all-strict"
-	@$(MAKE) --no-print-directory test-ts test-soroban test-evm
+	@$(MAKE) --no-print-directory test-ts test-soroban test-evm test-e2e
 	@echo "✔ test-all-strict complete — node, cargo, and forge were all present"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -162,7 +168,7 @@ lint-soroban: ## Clippy lint for Soroban contract
 lint-evm: ## Slither static analysis for EVM contract (requires slither)
 	@echo "▶ lint-evm"
 	@if command -v slither >/dev/null 2>&1; then \
-		cd contracts/evm && slither . --config-file slither.config.json; \
+		cd contracts/evm && slither src/ --config-file slither.config.json; \
 	else \
 		echo "slither not found — skipping EVM lint (install: pip install slither-analyzer)"; \
 	fi
@@ -176,7 +182,7 @@ fmt: fmt-ts fmt-soroban fmt-evm ## Auto-format all stacks
 fmt-ts: ## Format TypeScript (prettier, if configured)
 	@echo "▶ fmt-ts"
 	@if npm run fmt --if-present 2>/dev/null; then true; else \
-		echo "No fmt script found in root package.json — skipping TypeScript formatting"; \
+		echo "⏭ skipping fmt-ts — no fmt script configured (Prettier not yet introduced)"; \
 	fi
 
 fmt-soroban: ## Format Rust code (rustfmt)
@@ -199,12 +205,18 @@ fmt-evm: ## Format Solidity code (forge fmt)
 # COVERAGE
 # ─────────────────────────────────────────────────────────────────────────────
 
-coverage: coverage-ts coverage-evm ## Run coverage for all stacks (Rust uses cargo test)
+coverage: coverage-ts coverage-soroban coverage-evm ## Run coverage for all stacks
 
 coverage-ts: ## TypeScript test coverage via c8/node --experimental-test-coverage
 	@echo "▶ coverage-ts"
-	@if npm run coverage --if-present 2>/dev/null; then true; else \
-		node --test --experimental-test-coverage --import tsx sdk/test/*.test.ts; \
+	npm run test:coverage
+
+coverage-soroban: ## Soroban/Rust test coverage via cargo-llvm-cov
+	@echo "▶ coverage-soroban"
+	@if command -v cargo-llvm-cov >/dev/null 2>&1; then \
+		cd contracts/soroban && cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info; \
+	else \
+		echo "⏭ skipping coverage-soroban — cargo-llvm-cov not installed (install: cargo install cargo-llvm-cov)"; \
 	fi
 
 coverage-evm: ## EVM Solidity coverage via forge coverage
@@ -261,7 +273,7 @@ audit-evm: ## Slither + forge build for EVM (full static analysis pass)
 		echo "⏭ skipping audit-evm build step — forge not installed (install: https://getfoundry.sh)"; \
 	fi
 	@if command -v slither >/dev/null 2>&1; then \
-		cd contracts/evm && slither . --config-file slither.config.json; \
+		cd contracts/evm && slither src/ --config-file slither.config.json; \
 	else \
 		echo "slither not found — install with: pip install slither-analyzer"; \
 	fi
@@ -400,3 +412,30 @@ doctor: ## Report installed toolchain versions vs their pinned versions
 # ─────────────────────────────────────────────────────────────────────────────
 
 .DEFAULT_GOAL := help
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MUTATION TESTING
+# ─────────────────────────────────────────────────────────────────────────────
+# Configuration is committed (stryker*.config.mjs, .cargo-mutants.toml) and
+# .github/workflows/mutation-testing.yml invokes the same commands, so local
+# and nightly runs exercise identical settings. Both targets fail when the
+# score drops below the recorded baseline. See docs/mutation-testing.md.
+
+mutation: mutation-ts mutation-soroban ## Run all mutation testing (TypeScript + Soroban)
+
+mutation-ts: ## Run Stryker on the SDK, relayer and solver (fails below thresholds.break)
+	@echo "▶ mutation-ts"
+	@status=0; \
+	npx stryker run stryker.sdk.config.mjs || status=1; \
+	npx stryker run stryker.services.config.mjs || status=1; \
+	exit $$status
+
+mutation-soroban: ## Run cargo-mutants on the settlement contract (fails below baseline)
+	@echo "▶ mutation-soroban"
+	@if command -v cargo-mutants >/dev/null 2>&1; then \
+		cd contracts/soroban/settlement && cargo mutants --timeout 120 --output . ; \
+		rc=$$?; if [ $$rc -ne 0 ] && [ $$rc -ne 2 ] && [ $$rc -ne 3 ]; then exit $$rc; fi; \
+		cd - >/dev/null && node scripts/check-cargo-mutants-score.mjs contracts/soroban/settlement/mutants.out; \
+	else \
+		echo "⏭ skipping mutation-soroban — cargo-mutants not installed (cargo install cargo-mutants --locked)"; \
+	fi

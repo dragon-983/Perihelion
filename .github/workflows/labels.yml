@@ -1,0 +1,42 @@
+name: Labels
+
+# Creates every label declared in .github/labels.yml that does not exist yet,
+# so Dependabot and the workflows can apply the labels they reference (#769).
+# Existing labels are left untouched — colours and descriptions set by
+# maintainers in the UI are never overwritten.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/labels.yml
+      - .github/workflows/labels.yml
+  workflow_dispatch:
+
+permissions:
+  issues: write
+
+jobs:
+  sync:
+    name: Create missing labels
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create missing labels
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          existing=$(gh label list --repo "$REPO" --limit 500 --json name --jq '.[].name')
+          yq -o=json '.' .github/labels.yml | jq -c '.[]' | while read -r label; do
+            name=$(jq -r '.name' <<< "$label")
+            if grep -qxF "$name" <<< "$existing"; then
+              echo "✓ $name exists"
+              continue
+            fi
+            gh label create "$name" --repo "$REPO" \
+              --color "$(jq -r '.color' <<< "$label")" \
+              --description "$(jq -r '.description' <<< "$label")"
+            echo "+ created $name"
+          done

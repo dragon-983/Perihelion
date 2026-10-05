@@ -16,7 +16,6 @@ import type {
   Hex,
   Intent,
   IntentRecord,
-  IntentStatus,
   MempoolIntentStatus,
   SignedIntent,
 } from "./types.js";
@@ -262,7 +261,7 @@ export function parseIntentRecord(value: unknown): IntentRecord {
 
   return {
     ...signed,
-    status: v.status as IntentStatus,
+    status: v.status as MempoolIntentStatus,
     solver: v.solver as Address | undefined,
     settlementTx: v.settlementTx as string | undefined,
     createdAt: asTimestampInSeconds(v.createdAt, "createdAt"),

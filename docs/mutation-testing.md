@@ -31,7 +31,7 @@ it is a gap that could hide a real bug in the future.
 | Stack | Tool | Config |
 |-------|------|--------|
 | Soroban (Rust) | [cargo-mutants](https://mutants.rs/) | `contracts/soroban/settlement/.cargo-mutants.toml` |
-| TypeScript (sdk, relayer, solver) | [Stryker](https://stryker-mutator.io/) | `stryker.config.mjs` |
+| TypeScript (sdk, relayer, solver) | [Stryker](https://stryker-mutator.io/) | `stryker.config.mjs` (+ `stryker.sdk.config.mjs`, `stryker.services.config.mjs`) |
 | EVM (Solidity) | [vertigo-rs](https://github.com/JoranHonig/vertigo) | Foundry project at `contracts/evm/` |
 
 ---
@@ -42,24 +42,26 @@ it is a gap that could hide a real bug in the future.
 
 ```bash
 # Install once
-cargo install cargo-mutants --locked
+cargo install cargo-mutants --locked --version "24.7.1"
 
-# Run (from repo root)
-cd contracts/soroban/settlement
-cargo mutants --timeout 120
+# Run (from repo root) — same command and score gate as the nightly job
+make mutation-soroban
 # Results in contracts/soroban/settlement/mutants.out/
 ```
 
 ### TypeScript
 
+Stryker is a root devDependency, so `npm ci` is the only setup needed.
+
 ```bash
-# Install Stryker
-npm install --save-dev @stryker-mutator/core@8 @stryker-mutator/typescript-checker@8
+# Run both scopes exactly as the nightly job does
+make mutation-ts
 
-# Run all configured modules
-npx stryker run
+# Or one scope at a time
+npx stryker run stryker.sdk.config.mjs
+npx stryker run stryker.services.config.mjs
 
-# Run a single file quickly
+# Run a single file quickly (ad-hoc; not what CI runs)
 npx stryker run --mutate "sdk/src/intent.ts"
 # Results in reports/mutation/
 ```
@@ -87,6 +89,20 @@ You can also trigger it manually via **Actions → Mutation Testing → Run work
 and select which stack to test (`soroban | ts | evm | all`).
 
 Artefacts (full reports, surviving-mutant lists) are uploaded for 30 days after each run.
+
+### Score gates
+
+The nightly job **fails** when a score drops below its recorded baseline. Reports are
+uploaded first, so the surviving-mutant list is always available on a red run.
+
+| Stack | Baseline lives in | Mechanism |
+|-------|-------------------|-----------|
+| TypeScript | `thresholds.break` in `stryker.config.mjs` | Stryker exits non-zero below `break` |
+| Soroban | `BASELINE_MIN_SCORE` in `scripts/check-cargo-mutants-score.mjs` | Script scores `mutants.out/outcomes.json` |
+| EVM | — | Job fails if vertigo-rs itself fails |
+
+Baselines ratchet: when a nightly run scores higher, raise the baseline to match in the
+same PR that improved the tests. Never lower a baseline to get a run green.
 
 ---
 

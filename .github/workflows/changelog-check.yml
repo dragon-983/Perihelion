@@ -3,6 +3,9 @@ name: Changelog Check
 # Verifies that a PR whose title carries a user-facing conventional-commit
 # type (feat/fix) either updates CHANGELOG.md or is explicitly exempted via
 # the `no-changelog` label. See CONTRIBUTING.md#release-process.
+#
+# Dependabot PRs are exempt outright: they never touch CHANGELOG.md, and
+# relying on a label for them means a human has to intervene on every one.
 
 on:
   pull_request:
@@ -11,6 +14,12 @@ on:
 concurrency:
   group: changelog-check-${{ github.ref }}
   cancel-in-progress: true
+
+# Least-privilege: this job only reads PR metadata and labels.
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
 
 jobs:
   check:
@@ -22,8 +31,14 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           REPO: ${{ github.repository }}
         run: |
+          if [[ "$PR_AUTHOR" == "dependabot[bot]" ]]; then
+            echo "Dependabot PR — dependency bumps need no changelog entry."
+            exit 0
+          fi
+
           if ! [[ "$PR_TITLE" =~ ^(feat|fix)(\([a-z-]+\))?(!)?: ]]; then
             echo "PR title has no feat:/fix: prefix — no changelog entry required."
             exit 0

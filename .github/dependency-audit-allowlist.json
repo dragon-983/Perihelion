@@ -1,5 +1,18 @@
 {
   "npm": {
-    "advisories": []
+    "advisories": [
+      {
+        "package": "toml",
+        "title": "toml-node: Uncontrolled Recursion",
+        "rationale": "Transitive via @stellar/stellar-sdk@12.x (relayer). The only fix is @stellar/stellar-sdk 17.1.0, a major upgrade that renames the SorobanRpc namespace used throughout relayer/src/soroban-delivery.ts; tracked in #758 alongside a planned rework of that file. toml is not reachable with attacker-controlled input in this codebase.",
+        "expiry": "2026-12-31"
+      },
+      {
+        "package": "toml",
+        "title": "toml-node: Prototype Pollution Leads to `Object.prototype` Corruption via `__proto__` Key-Path Desynchronization",
+        "rationale": "Transitive via @stellar/stellar-sdk@12.x (relayer). The only fix is @stellar/stellar-sdk 17.1.0, a major upgrade that renames the SorobanRpc namespace used throughout relayer/src/soroban-delivery.ts; tracked in #758 alongside a planned rework of that file. Accepted as short-term risk pending the sequenced upgrade.",
+        "expiry": "2026-12-31"
+      }
+    ]
   }
 }

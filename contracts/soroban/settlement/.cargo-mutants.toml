@@ -1,12 +1,12 @@
 # cargo-mutants configuration for the Perihelion Soroban settlement contract.
 #
-# Run locally:
-#   cargo install cargo-mutants       # one-time
-#   cd contracts/soroban/settlement
-#   cargo mutants --timeout 120
+# Run locally (from the repository root):
+#   cargo install cargo-mutants --locked --version "24.7.1"   # one-time
+#   make mutation-soroban
 #
-# The nightly CI job (.github/workflows/mutation-testing.yml) runs this
-# automatically and uploads the mutants.out/ report as an artefact.
+# The nightly CI job (.github/workflows/mutation-testing.yml) runs the same
+# command, uploads the mutants.out/ report as an artefact, and fails if the
+# score drops below the recorded baseline.
 #
 # See: https://mutants.rs/configuration.html
 
@@ -34,9 +34,8 @@ exclude_globs = [
     "src/endpoint.rs",
 ]
 
-# Minimum acceptable mutation score.  Below this threshold the CI job fails.
-# Start at 60 % and raise as the test suite is hardened.  Track progress in
-# docs/mutation-testing.md.
-# Note: cargo-mutants does not enforce this natively; the CI job script reads
-# mutants.out/outcomes.json and asserts the score.
-# minimum_score = 60
+# Minimum acceptable mutation score.  cargo-mutants has no native score
+# threshold (it exits non-zero on *any* missed mutant), so the baseline lives
+# in scripts/check-cargo-mutants-score.mjs, which both `make mutation-soroban`
+# and the nightly CI job run against mutants.out/outcomes.json.  Ratchet it up
+# as the suite is hardened; track progress in docs/mutation-testing.md.

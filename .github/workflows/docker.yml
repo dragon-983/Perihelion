@@ -1,0 +1,163 @@
+name: Docker
+
+# Builds every service image from the root Dockerfile and starts each one
+# with a minimal valid configuration, waiting for the image's own
+# HEALTHCHECK to report healthy. Nothing else in CI builds the image, so
+# without this job a broken Dockerfile (#771) goes unnoticed until someone
+# runs `docker compose up`.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - docker/**
+      - docker-compose.yml
+      - package.json
+      - package-lock.json
+      - sdk/**
+      - relayer/**
+      - solver/**
+      - mempool/**
+      - .github/workflows/docker.yml
+  pull_request:
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - docker/**
+      - docker-compose.yml
+      - package.json
+      - package-lock.json
+      - sdk/**
+      - relayer/**
+      - solver/**
+      - mempool/**
+      - .github/workflows/docker.yml
+  workflow_dispatch:
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  image:
+    name: Build and smoke-test (${{ matrix.package }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [relayer, solver, mempool]
+    env:
+      IMAGE: perihelion-${{ matrix.package }}:ci
+      # Throwaway test credentials — the same public fixtures the unit
+      # tests use. The containers never reach a live network.
+      TEST_STELLAR_SECRET: SBZVMB74Z76QB3ZL2YFBN7EWUIXVXSNXKNQRIPZTKMZDDQ3FJBNRHWBU
+      TEST_EVM_KEY: "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+      ZERO_ADDRESS: "0x0000000000000000000000000000000000000000"
+      SETTLEMENT_ID: CA7QYNF7SOWQ3GLR4CIDVXIUCMEOBEEUHW5C33ATIO5Q5TR3LYAQHRJS
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          build-args: PACKAGE=${{ matrix.package }}
+          tags: ${{ env.IMAGE }}
+          load: true
+          push: false
+          cache-from: type=gha,scope=${{ matrix.package }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.package }}
+
+      - name: Assert no dev dependencies in the runtime image
+        run: |
+          for dep in typescript tsx c8 @types/node lefthook; do
+            if docker run --rm --entrypoint sh "$IMAGE" -c "test -e /app/node_modules/$dep"; then
+              echo "::error::dev dependency '$dep' is present in the runtime image"
+              exit 1
+            fi
+          done
+          echo "✓ runtime image carries production dependencies only"
+
+      - name: Write minimal environment
+        run: |
+          case "${{ matrix.package }}" in
+            mempool)
+              cat > service.env <<ENV
+          PERIHELION_SOURCE_CHAIN_ID=31337
+          PERIHELION_ESCROW_ADDRESS=$ZERO_ADDRESS
+          ENV
+              ;;
+            relayer)
+              cat > service.env <<ENV
+          PERIHELION_EVM_RPC_URL=http://127.0.0.1:8545
+          PERIHELION_STELLAR_RPC_URL=http://127.0.0.1:8000
+          PERIHELION_SOURCE_EID=30101
+          PERIHELION_STELLAR_EID=40161
+          STELLAR_NETWORK=Test SDF Network ; September 2015
+          PERIHELION_ESCROW_ADDRESS=$ZERO_ADDRESS
+          PERIHELION_SETTLEMENT_CONTRACT=$SETTLEMENT_ID
+          SIGNER_SECRET=$TEST_STELLAR_SECRET
+          PERIHELION_CHECKPOINT_FILE=/tmp/relayer-checkpoint.json
+          ENV
+              ;;
+            solver)
+              cat > service.env <<ENV
+          PERIHELION_MEMPOOL_URL=http://127.0.0.1:3000
+          PERIHELION_SOLVER_ADDRESS=$ZERO_ADDRESS
+          PERIHELION_SOURCE_CHAIN_ID=31337
+          PERIHELION_ESCROW_ADDRESS=$ZERO_ADDRESS
+          PERIHELION_SUPPORTED_ASSETS=native
+          PERIHELION_EVM_RPC_URL=http://127.0.0.1:8545
+          PERIHELION_EVM_PRIVATE_KEY=$TEST_EVM_KEY
+          PERIHELION_SOROBAN_RPC_URL=http://127.0.0.1:8000
+          PERIHELION_SOROBAN_SECRET_KEY=$TEST_STELLAR_SECRET
+          PERIHELION_SETTLEMENT_CONTRACT_ID=$SETTLEMENT_ID
+          STELLAR_NETWORK=Test SDF Network ; September 2015
+          ENV
+              ;;
+          esac
+          sed -i 's/^ *//' service.env
+
+      - name: Start container and wait for healthy
+        run: |
+          docker run -d --name svc --env-file service.env \
+            --health-interval 3s --health-start-period 5s --health-retries 5 \
+            "$IMAGE"
+          for _ in $(seq 1 30); do
+            status=$(docker inspect -f '{{.State.Health.Status}}' svc 2>/dev/null || echo missing)
+            running=$(docker inspect -f '{{.State.Running}}' svc 2>/dev/null || echo false)
+            echo "health=$status running=$running"
+            if [ "$status" = healthy ]; then
+              echo "✓ ${{ matrix.package }} container is healthy"
+              exit 0
+            fi
+            if [ "$running" != true ] || [ "$status" = unhealthy ]; then
+              break
+            fi
+            sleep 3
+          done
+          echo "::error::${{ matrix.package }} container did not become healthy"
+          exit 1
+
+      - name: Container logs
+        if: always()
+        run: docker logs svc 2>&1 | tail -100 || true
+
+  compose-config:
+    name: docker compose config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate docker-compose.yml
+        env:
+          SIGNER_SECRET: placeholder
+          PERIHELION_EVM_PRIVATE_KEY: placeholder
+          PERIHELION_SOROBAN_SECRET_KEY: placeholder
+        run: docker compose config --quiet

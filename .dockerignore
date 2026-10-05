@@ -77,3 +77,8 @@ npm-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 .nyc_output
+
+# Mutation testing output
+.stryker-tmp/
+reports/
+mutants.out/

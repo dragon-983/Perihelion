@@ -7,6 +7,13 @@ name: Mutation Testing
 #   mutants-soroban   — cargo-mutants on the Soroban settlement contract (Rust)
 #   mutants-ts        — Stryker on the TypeScript packages (sdk, relayer, solver)
 #   mutants-evm       — vertigo-rs / forge-based mutation testing for EVM contracts
+#
+# Each job records the tool's exit status instead of suppressing it, uploads
+# its report unconditionally, and only then fails in a final "Enforce" step.
+# That keeps the artefact on a bad night without turning the job into a
+# report nobody is accountable for (#768). Thresholds are committed config:
+#   Stryker        thresholds.break in stryker.config.mjs
+#   cargo-mutants  BASELINE_MIN_SCORE in scripts/check-cargo-mutants-score.mjs
 
 on:
   schedule:
@@ -29,6 +36,10 @@ concurrency:
   group: mutation-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Least-privilege default; jobs only check out, build, and run mutation tools.
+permissions:
+  contents: read
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Soroban / Rust: cargo-mutants
 # ─────────────────────────────────────────────────────────────────────────────
@@ -40,15 +51,15 @@ jobs:
       github.event_name == 'schedule' ||
       github.event_name == 'workflow_dispatch' && (inputs.stack == 'soroban' || inputs.stack == 'all')
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.2.2
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87  # stable (pinned)
         with:
           targets: wasm32-unknown-unknown
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.2.3
         with:
           path: |
             ~/.cargo/registry
@@ -59,41 +70,47 @@ jobs:
       - name: Install cargo-mutants
         run: cargo install cargo-mutants --locked --version "24.7.1"
 
+      # Same command as `make mutation-soroban`. `--output .` places the
+      # report at ./mutants.out (cargo-mutants creates mutants.out *inside*
+      # the --output directory). Exit codes: 0 all caught, 2 missed mutants,
+      # 3 timeouts — those are scored by the gate below; anything else
+      # (baseline test failure, usage error) fails the job outright.
       - name: Run cargo-mutants on settlement contract
+        id: mutants
         working-directory: contracts/soroban/settlement
         run: |
-          cargo mutants \
-            --timeout 120 \
-            --jobs 2 \
-            --output mutants.out \
-            2>&1 | tee mutation-report.txt
-        continue-on-error: true  # upload report even on threshold failure
+          set +e
+          cargo mutants --timeout 120 --jobs 2 --output . 2>&1 | tee mutation-report.txt
+          echo "exit=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
 
       - name: Summarise results
+        if: always()
         working-directory: contracts/soroban/settlement
         run: |
           echo "## Soroban Mutation Testing Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          if [ -f mutants.out/outcomes.json ]; then
-            CAUGHT=$(python3 -c "
-          import json, sys
-          data = json.load(open('mutants.out/outcomes.json'))
-          total  = len(data)
-          caught = sum(1 for m in data if m.get('outcome') in ('caught', 'Caught'))
-          missed = total - caught
-          score  = round(caught / total * 100, 1) if total > 0 else 0
-          print(f'Total: {total}  Caught: {caught}  Missed: {missed}  Score: {score}%')
-          " 2>/dev/null || echo "Could not parse outcomes.json")
-            echo "cargo-mutants: $CAUGHT" >> $GITHUB_STEP_SUMMARY
-          fi
-          cat mutation-report.txt | tail -30 >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          tail -30 mutation-report.txt >> $GITHUB_STEP_SUMMARY || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
 
       - name: Upload cargo-mutants report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: soroban-mutants-report
-          path: contracts/soroban/settlement/mutants.out/
+          path: |
+            contracts/soroban/settlement/mutants.out/
+            contracts/soroban/settlement/mutation-report.txt
+
+      - name: Enforce mutation score baseline
+        if: always()
+        env:
+          MUTANTS_EXIT: ${{ steps.mutants.outputs.exit }}
+        run: |
+          case "$MUTANTS_EXIT" in
+            0|2|3) node scripts/check-cargo-mutants-score.mjs contracts/soroban/settlement/mutants.out ;;
+            *) echo "::error::cargo-mutants did not complete (exit '${MUTANTS_EXIT:-none}')"; exit 1 ;;
+          esac
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TypeScript: Stryker
@@ -105,10 +122,10 @@ jobs:
       github.event_name == 'schedule' ||
       github.event_name == 'workflow_dispatch' && (inputs.stack == 'ts' || inputs.stack == 'all')
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.2.2
 
       - name: Set up Node.js 20
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
         with:
           node-version: 20
           cache: npm
@@ -119,36 +136,28 @@ jobs:
       - name: Build TypeScript packages
         run: npm run build
 
-      - name: Install Stryker
-        run: |
-          npm install --save-dev \
-            @stryker-mutator/core@8 \
-            @stryker-mutator/typescript-checker@8
-        # Install locally rather than globally so the version is pinned in CI.
-
+      # Stryker is a root devDependency resolved from package-lock.json, and
+      # all settings (mutate scope, runner, thresholds, reporters) come from
+      # the committed stryker*.config.mjs files — the same ones
+      # `make mutation-ts` uses. No CLI overrides here, so local and CI runs
+      # cannot drift.
       - name: Run Stryker on SDK (highest priority)
+        id: stryker-sdk
         run: |
-          npx stryker run \
-            --mutate "sdk/src/intent.ts,sdk/src/validate.ts,sdk/src/units.ts,sdk/src/stellar.ts" \
-            --testRunner command \
-            --commandRunner.command "node --test --import ./node_modules/tsx/dist/esm/index.cjs sdk/test/*.test.ts" \
-            --reporters json,clear-text \
-            --jsonReporter.fileName reports/mutation/sdk-mutation.json \
-            2>&1 | tee sdk-mutation-report.txt
-        continue-on-error: true
+          set +e
+          npx stryker run stryker.sdk.config.mjs 2>&1 | tee sdk-mutation-report.txt
+          echo "exit=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
 
       - name: Run Stryker on relayer + solver
+        id: stryker-services
+        if: always()
         run: |
-          npx stryker run \
-            --mutate "relayer/src/relayer.ts,relayer/src/soroban-delivery.ts,solver/src/quote.ts,solver/src/executor.ts" \
-            --testRunner command \
-            --commandRunner.command "node --test --import ./node_modules/tsx/dist/esm/index.cjs relayer/test/*.test.ts solver/test/*.test.ts" \
-            --reporters json,clear-text \
-            --jsonReporter.fileName reports/mutation/solver-mutation.json \
-            2>&1 | tee solver-mutation-report.txt
-        continue-on-error: true
+          set +e
+          npx stryker run stryker.services.config.mjs 2>&1 | tee solver-mutation-report.txt
+          echo "exit=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
 
       - name: Summarise Stryker results
+        if: always()
         run: |
           echo "## TypeScript Mutation Testing Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -162,13 +171,32 @@ jobs:
 
       - name: Upload Stryker reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: stryker-mutation-report
           path: |
             sdk-mutation-report.txt
             solver-mutation-report.txt
             reports/mutation/
+
+      # Stryker exits non-zero when the score is below thresholds.break
+      # (or the run itself errors); re-raise that now the reports are safe.
+      - name: Enforce mutation score baseline
+        if: always()
+        env:
+          SDK_EXIT: ${{ steps.stryker-sdk.outputs.exit }}
+          SERVICES_EXIT: ${{ steps.stryker-services.outputs.exit }}
+        run: |
+          status=0
+          if [ "$SDK_EXIT" != "0" ]; then
+            echo "::error::Stryker (sdk) failed or scored below thresholds.break (exit '${SDK_EXIT:-none}')"
+            status=1
+          fi
+          if [ "$SERVICES_EXIT" != "0" ]; then
+            echo "::error::Stryker (relayer + solver) failed or scored below thresholds.break (exit '${SERVICES_EXIT:-none}')"
+            status=1
+          fi
+          exit $status
 
 # ─────────────────────────────────────────────────────────────────────────────
 # EVM / Solidity: vertigo-rs (forge-based mutation testing)
@@ -180,10 +208,10 @@ jobs:
       github.event_name == 'schedule' ||
       github.event_name == 'workflow_dispatch' && (inputs.stack == 'evm' || inputs.stack == 'all')
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.2.2
 
       - name: Install Foundry
-        uses: foundry-rs/foundry-toolchain@v1
+        uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09  # v1.6.0
         with:
           version: ${{ env.FOUNDRY_VERSION }}
 
@@ -192,9 +220,11 @@ jobs:
         run: forge install foundry-rs/forge-std@${{ env.FORGE_STD_VERSION }} --no-git
 
       - name: Install Rust (required by vertigo-rs)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87  # stable (pinned)
 
       - name: Install vertigo-rs
+        # TODO(maintainer): pin to a specific crates.io version once verified;
+        # crates.io could not be reached from this environment to confirm one.
         run: cargo install vertigo-rs --locked
 
       - name: Build EVM contracts
@@ -202,14 +232,17 @@ jobs:
         run: forge build
 
       - name: Run vertigo-rs mutation testing
+        id: vertigo
         working-directory: contracts/evm
         run: |
+          set +e
           vertigo run \
             --match-contract PerihelionEscrow \
             2>&1 | tee mutation-report.txt
-        continue-on-error: true
+          echo "exit=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
 
       - name: Summarise EVM results
+        if: always()
         run: |
           echo "## EVM Mutation Testing Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -219,10 +252,20 @@ jobs:
 
       - name: Upload EVM mutation report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: evm-mutation-report
           path: contracts/evm/mutation-report.txt
+
+      - name: Enforce vertigo-rs result
+        if: always()
+        env:
+          VERTIGO_EXIT: ${{ steps.vertigo.outputs.exit }}
+        run: |
+          if [ "$VERTIGO_EXIT" != "0" ]; then
+            echo "::error::vertigo-rs failed (exit '${VERTIGO_EXIT:-none}')"
+            exit 1
+          fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Summary
@@ -245,3 +288,16 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "Download artefacts for the full report (surviving mutants, triage list)." >> $GITHUB_STEP_SUMMARY
           echo "See docs/mutation-testing.md for how to action surviving mutants." >> $GITHUB_STEP_SUMMARY
+
+      # Surface a red run at the top level too. "skipped" is fine (the
+      # stack was not selected on a manual dispatch); anything else is not.
+      - name: Fail if any stack failed
+        env:
+          RESULTS: ${{ needs.mutants-soroban.result }} ${{ needs.mutants-ts.result }} ${{ needs.mutants-evm.result }}
+        run: |
+          for r in $RESULTS; do
+            case "$r" in
+              success|skipped) ;;
+              *) echo "::error::a mutation-testing job finished with result '$r'"; exit 1 ;;
+            esac
+          done
