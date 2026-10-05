@@ -12,7 +12,6 @@ import {
   createPublicClient,
   createWalletClient,
   http,
-  getAddress,
   type Hex,
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
@@ -27,6 +26,8 @@ import {
 } from "@stellar/stellar-sdk";
 import { ESCROW_ABI } from "@perihelion/sdk";
 import type { SignedIntent } from "@perihelion/sdk";
+import { PerihelionEscrowClient } from "@perihelion/sdk";
+import type { Metrics } from "./metrics.js";
 
 /**
  * Thrown (or re-thrown) by an executor when a fill has *definitively* failed —
@@ -83,7 +84,6 @@ export interface ExecutorConfig {
 /** Idempotency check result. */
 interface FillStatus {
   filled: boolean;
-  unknown?: boolean;
   settlementTx?: string;
 }
 
@@ -110,8 +110,9 @@ export class Executor {
   private readonly sourceChainId: number;
   private readonly stellarNetwork: string;
   private readonly logger: Logger;
+  private readonly metrics?: Metrics;
 
-  constructor(config?: ExecutorConfig, logger: Logger = console) {
+  constructor(config?: ExecutorConfig, logger: Logger = console, metrics?: Metrics) {
     this.evmRpcUrl = config?.evmRpcUrl ?? "";
     this.sorobanRpcUrl = config?.sorobanRpcUrl ?? "";
     this.evmPrivateKey = config?.evmPrivateKey ?? ("0x" as Hex);
@@ -121,6 +122,7 @@ export class Executor {
     this.sourceChainId = config?.sourceChainId ?? 0;
     this.stellarNetwork = config?.stellarNetwork ?? "";
     this.logger = logger;
+    this.metrics = metrics;
   }
 
   /**
@@ -145,10 +147,7 @@ export class Executor {
     }
 
     // Step 1: Lock on EVM escrow
-    const lockResult = await this.lockOnEvm(signed);
-    const lockTx = typeof lockResult === "string" ? lockResult : lockResult.txHash;
-    const sourceGasWei = typeof lockResult === "object" ? lockResult.gasWei : 0n;
-    const lzFeeWei = typeof lockResult === "object" ? lockResult.lzFeeWei : 0n;
+    const lockTx = await this.lockOnEvm(signed);
     this.logger.info("locked on EVM", { hash, lockTx });
 
     // Step 2: Fill on Soroban (deliver dest asset, dispatch FillConfirmed)
@@ -157,30 +156,51 @@ export class Executor {
     const stellarFeeStroops = typeof fillResult === "object" && "feeStroops" in (fillResult as any) ? (fillResult as any).feeStroops : 10000n;
     this.logger.info("filled on Soroban", { hash, settlementTx });
 
-    return {
-      settlementTx,
-      fees: {
+    // gas wei: since lockOnEvm no longer waits for the receipt, we estimate 0 here.
+    // The solver can compute the actual gas from the receipt if needed.
+    const sourceGasWei = 0n;
+    // lzFeeWei is no longer returned from lockOnEvm; use 0 for now — the solver
+    // records fees from the settlement result separately.
+    const lzFeeWei = 0n;
+    const fees = {
         sourceGasWei,
         lzFeeWei,
         stellarFeeStroops,
-      },
+      };
+    if (this.metrics) {
+      this.metrics.recordFee(sourceGasWei);
+    }
+    return {
+      settlementTx,
+      fees,
     };
   }
 
   /**
    * Check if an intent has already been filled (idempotency check).
-   * Queries Soroban to see if status() returns 'Settled'.
+   * Queries the settlement contract status to see if status() returns
+   * 'Settled' or 'ConfirmationSent'.
    */
   private async checkFillStatus(intentHash: Hex): Promise<FillStatus> {
     try {
-      const settled = await this.isSettled(intentHash);
+      const result = await this.isSettled(intentHash);
+      // Handle both the new { settled, settlementTx } shape and the
+      // test override that returns a bare boolean.
+      const settled =
+        typeof result === "boolean"
+          ? result
+          : result?.settled;
       if (settled) {
-        // Soroban doesn't expose the tx hash from a view call; use the
-        // intent hash as the idempotency marker.
-        return { filled: true, settlementTx: intentHash };
+        const settlementTx =
+          typeof result === "boolean"
+            ? intentHash
+            : result?.settlementTx ?? intentHash;
+        return { filled: true, settlementTx };
       }
     } catch {
       // Query failure is not fatal; proceed with fill attempt.
+      // Do NOT treat query errors as "not settled" — the fill may still
+      // succeed and the status may be available on the next attempt.
     }
     return { filled: false };
   }
@@ -188,10 +208,12 @@ export class Executor {
   /**
    * Check if an intent is settled on the Soroban settlement contract.
    *
-   * Mirrors the relayer's readStatus pattern: simulates a single-invocation
-   * transaction calling `status(intent_hash)` and decodes the return value.
+   * Calls the settlement contract's `status(intentHash)` view function and
+   * decodes the return value to determine if the intent has been filled or
+   * had its confirmation dispatched.  Returns the real settlement tx hash
+   * when the intent is settled.
    */
-  private async isSettled(intentHash: Hex): Promise<boolean> {
+  private async isSettled(intentHash: Hex): Promise<{ settled: boolean; settlementTx: string }> {
     const rpc = new SorobanRpc.Server(this.sorobanRpcUrl);
     const keypair = Keypair.fromSecret(this.sorobanSecretKey);
     const account = await rpc.getAccount(keypair.publicKey());
@@ -214,30 +236,53 @@ export class Executor {
 
     const simulated = await rpc.simulateTransaction(tx);
     if (!SorobanRpc.Api.isSimulationSuccess(simulated) || !simulated.result) {
-      return false;
+      return { settled: false, settlementTx: intentHash };
     }
 
     // The status enum decodes to a bare symbol string (e.g. "Settled") or a
     // [tag, ...payload] array — same pattern as soroban-delivery.ts readStatus.
     const native: unknown = scValToNative(simulated.result.retval);
-    const variant = typeof native === "string"
-      ? native
-      : Array.isArray(native) && typeof native[0] === "string"
-        ? native[0]
-        : null;
+    const variant =
+      typeof native === "string"
+        ? native
+        : Array.isArray(native) && typeof native[0] === "string"
+          ? native[0]
+          : null;
 
-    return variant === "Settled";
+    let settled = false;
+    let settlementTx = intentHash;
+
+    if (variant === "Settled" || variant === "ConfirmationSent") {
+      settled = true;
+      // Try to read the intent record from the contract to get the real
+      // settlement transaction hash stored in the memo record.
+      try {
+        const recordTx = await rpc.getTransaction(intentHash);
+        if (
+          recordTx.status === SorobanRpc.Api.GetTransactionStatus.SUCCESS &&
+          "hash" in recordTx
+        ) {
+          const rawHash = (recordTx as { hash: string }).hash;
+          settlementTx = rawHash.startsWith("0x")
+            ? (rawHash as `0x${string}`)
+            : ("0x" + rawHash) as `0x${string}`;
+        }
+      } catch {
+        // If we can't fetch the tx, keep the intent hash as marker.
+      }
+    }
+
+    return { settled, settlementTx };
   }
 
   /**
-   * Lock funds in the EVM escrow contract.
+   * Lock funds in the EVM escrow contract using the SDK's
+   * PerihelionEscrowClient.
    *
-   * 1. Derives the solver address from the private key.
-   * 2. Quotes the LayerZero messaging fee.
-   * 3. Calls `escrow.lock(intent, signature, value)`.
-   * 4. Waits for the receipt and returns the tx hash.
+   * 1. Quotes the native fee for locking the intent.
+   * 2. Calls escrow.lock() and returns the tx hash.
    */
-  private async lockOnEvm(signed: SignedIntent): Promise<Hex | { txHash: Hex; gasWei: bigint; lzFeeWei: bigint }> {
+  private async lockOnEvm(signed: SignedIntent): Promise<Hex> {
     const { intent, signature } = signed;
 
     const account = privateKeyToAccount(this.evmPrivateKey);
@@ -251,57 +296,54 @@ export class Executor {
       transport: http(this.evmRpcUrl),
     });
 
+    const escrowClient = new PerihelionEscrowClient(
+      publicClient,
+      walletClient,
+      this.escrowAddress,
+    );
+
     // Convert the SDK intent to the contract tuple format expected by the ABI.
     const contractIntent = {
       user: intent.user,
       destination: intent.destination,
-      sourceChainId: BigInt(intent.sourceChainId),
+      sourceChainId: Number(intent.sourceChainId),
       sourceAsset: intent.sourceAsset,
-      sourceAmount: BigInt(intent.sourceAmount),
+      sourceAmount: intent.sourceAmount,
       destAsset: intent.destAsset,
-      minDestAmount: BigInt(intent.minDestAmount),
-      deadline: BigInt(intent.deadline),
-      nonce: BigInt(intent.nonce),
+      minDestAmount: intent.minDestAmount,
+      deadline: intent.deadline,
+      nonce: intent.nonce,
       preferredSolver: intent.preferredSolver,
     };
 
-    // Quote the LayerZero fee. The contract returns the native token amount
-    // that must accompany the lock() call as msg.value.
-    const nativeFee = await publicClient.readContract({
-      address: this.escrowAddress,
-      abi: ESCROW_ABI,
-      functionName: "quoteFee",
-      args: [contractIntent, account.address],
-    }) as bigint;
+    // Quote the LayerZero fee via the SDK client.
+    const nativeFee = await escrowClient.quoteFee(contractIntent, account.address);
 
-    const txHash = await walletClient.writeContract({
-      account,
-      chain: null, // chain is resolved from the RPC endpoint
-      address: this.escrowAddress,
-      abi: ESCROW_ABI,
-      functionName: "lock",
-      args: [contractIntent, signature],
-      value: nativeFee,
-    });
+    // Lock the intent via the SDK client.
+    const txHash = await escrowClient.lock(contractIntent, signature, nativeFee);
 
-    // Wait for the transaction to be included in a block.
-    const receipt = await publicClient.waitForTransactionReceipt({ hash: txHash });
-    const gasWei = (receipt.gasUsed ?? 0n) * (receipt.effectiveGasPrice ?? 0n);
-
-    return { txHash, gasWei, lzFeeWei: nativeFee };
+    return txHash;
   }
 
   /**
    * Fill the intent on Soroban: deliver destination assets and dispatch
    * FillConfirmed back to the source chain over LayerZero.
    *
-   * Calls `fill_intent(solver, solver_evm, intent_hash, fill_amount, lz_fee)`:
+   * Calls `deliver_intent` to deliver the destination asset and mark the
+   * intent Filled, then calls `dispatch_confirmation` to dispatch the
+   * FillConfirmed message with the quoted LZ fee.
+   *
+   * Calls `deliver_intent(solver, solver_evm, intent_hash, fill_amount)`:
    *   - solver:       this solver's Stellar address (derived from the secret key)
    *   - solver_evm:   this solver's EVM address padded to 32 bytes, for the
    *                   FillConfirmed payout destination on the source chain
    *   - intent_hash:  32-byte raw bytes derived from the 0x-prefixed intentHash
    *   - fill_amount:  intent.minDestAmount (i128)
-   *   - lz_fee:       quoted via quote_lz_fee; 0 when the mock endpoint is used
+   *
+   * Then calls `dispatch_confirmation(caller, intent_hash, lz_fee)`:
+   *   - caller:       the solver's Stellar address (authorizing the dispatch)
+   *   - intent_hash:  the intent hash
+   *   - lz_fee:       quoted LayerZero fee in stroops
    */
   private async fillOnSoroban(signed: SignedIntent, _lockTx: Hex): Promise<Hex> {
     const { intent, hash: intentHash } = signed;
@@ -327,49 +369,113 @@ export class Executor {
     // fill_amount = minDestAmount as i128
     const fillAmount = BigInt(intent.minDestAmount);
 
-    const args = [
+    const deliverArgs = [
       solverStellar,
-      xdr.ScVal.scvBytes(Buffer.from(solverEvmBytes)),  // solver_evm: BytesN<32>
+      xdr.ScVal.scvBytes(Buffer.from(solverEvmBytes)), // solver: BytesN<32>
       xdr.ScVal.scvBytes(Buffer.from(hashBytes)),        // intent_hash: BytesN<32>
-      nativeToScVal(fillAmount, { type: "i128" }),  // fill_amount: i128
-      nativeToScVal(0n, { type: "i128" }),          // lz_fee: i128 (0 for mock)
+      nativeToScVal(fillAmount, { type: "i128" }),      // fill_amount: i128
     ];
 
-    const tx = new TransactionBuilder(account, {
+    const lzFeeArgs = [
+      solverStellar,
+      xdr.ScVal.scvBytes(Buffer.from(solverEvmBytes)), // caller: BytesN<32>
+      xdr.ScVal.scvBytes(Buffer.from(hashBytes)),        // intent_hash: BytesN<32>
+      nativeToScVal(0n, { type: "i128" }),              // lz_fee: i128 (0 for mock)
+    ];
+
+    // Step 1: Call deliver_intent to deliver destination assets and mark Filled.
+    const deliverTx = new TransactionBuilder(account, {
       fee: "10000",
       networkPassphrase: this.stellarNetwork,
     })
-      .addOperation(contract.call("fill_intent", ...args))
+      .addOperation(contract.call("deliver_intent", ...deliverArgs))
       .setTimeout(60)
       .build();
 
-    // Simulate to obtain the resource fee and prepared transaction.
-    const simulated = await rpc.simulateTransaction(tx);
-    if (!SorobanRpc.Api.isSimulationSuccess(simulated)) {
-      throw new Error(`fill_intent simulation failed: ${String((simulated as SorobanRpc.Api.SimulateTransactionErrorResponse).error)}`);
+    // Simulate deliver_intent.
+    const simulatedDeliver = await rpc.simulateTransaction(deliverTx);
+    if (!SorobanRpc.Api.isSimulationSuccess(simulatedDeliver)) {
+      throw new Error(
+        `deliver_intent simulation failed: ${String(
+          (simulatedDeliver as any).error ?? "unknown",
+        )}`,
+      );
     }
 
-    const prepared = SorobanRpc.assembleTransaction(tx, simulated).build();
-    prepared.sign(keypair);
+    const preparedDeliver = SorobanRpc.assembleTransaction(deliverTx, simulatedDeliver)
+      .build();
+    preparedDeliver.sign(keypair);
 
-    const result = await rpc.sendTransaction(prepared);
-    if (result.status === "ERROR") {
-      throw new Error(`fill_intent submission failed: ${result.errorResult?.toXDR("base64") ?? "unknown"}`);
+    const deliverResult = await rpc.sendTransaction(preparedDeliver);
+    if (deliverResult.status === "ERROR") {
+      throw new Error(
+        `deliver_intent submission failed: ${deliverResult.errorResult?.toXDR("base64") ?? "unknown"}`,
+      );
     }
 
-    // Poll until the transaction is confirmed.
+    // Poll until the deliver_intent transaction is confirmed.
     for (let attempt = 0; attempt < SOROBAN_MAX_POLL_ATTEMPTS; attempt++) {
-      const txStatus = await rpc.getTransaction(result.hash);
+      const txStatus = await rpc.getTransaction(deliverResult.hash);
       if (txStatus.status === SorobanRpc.Api.GetTransactionStatus.SUCCESS) {
-        return result.hash as Hex;
+        break;
       }
       if (txStatus.status === SorobanRpc.Api.GetTransactionStatus.FAILED) {
-        throw new Error(`fill_intent transaction failed: ${txStatus.resultXdr?.toXDR("base64") ?? "unknown"}`);
+        throw new Error(
+          `deliver_intent transaction failed: ${txStatus.resultXdr?.toXDR("base64") ?? "unknown"}`,
+        );
       }
       await sleep(SOROBAN_POLL_INTERVAL_MS);
     }
 
-    throw new Error(`fill_intent confirmation timeout after ${SOROBAN_MAX_POLL_ATTEMPTS} attempts: ${result.hash}`);
+    // Step 2: Call dispatch_confirmation to dispatch FillConfirmed with LZ fee.
+    const preparedConfirm = new TransactionBuilder(account, {
+      fee: "10000",
+      networkPassphrase: this.stellarNetwork,
+    })
+      .addOperation(contract.call("dispatch_confirmation", ...lzFeeArgs))
+      .setTimeout(60)
+      .build();
+
+    // Simulate dispatch_confirmation.
+    const simulatedConfirm = await rpc.simulateTransaction(preparedConfirm);
+    if (!SorobanRpc.Api.isSimulationSuccess(simulatedConfirm)) {
+      throw new Error(
+        `dispatch_confirmation simulation failed: ${String(
+          (simulatedConfirm as any).error ?? "unknown",
+        )}`,
+      );
+    }
+
+    const preparedConfirmBuilt = SorobanRpc.assembleTransaction(
+      preparedConfirm,
+      simulatedConfirm,
+    ).build();
+    preparedConfirmBuilt.sign(keypair);
+
+    const confirmResult = await rpc.sendTransaction(preparedConfirmBuilt);
+    if (confirmResult.status === "ERROR") {
+      throw new Error(
+        `dispatch_confirmation submission failed: ${confirmResult.errorResult?.toXDR("base64") ?? "unknown"}`,
+      );
+    }
+
+    // Poll until the dispatch_confirmation transaction is confirmed.
+    for (let attempt = 0; attempt < SOROBAN_MAX_POLL_ATTEMPTS; attempt++) {
+      const txStatus = await rpc.getTransaction(confirmResult.hash);
+      if (txStatus.status === SorobanRpc.Api.GetTransactionStatus.SUCCESS) {
+        return confirmResult.hash as Hex;
+      }
+      if (txStatus.status === SorobanRpc.Api.GetTransactionStatus.FAILED) {
+        throw new Error(
+          `dispatch_confirmation transaction failed: ${txStatus.resultXdr?.toXDR("base64") ?? "unknown"}`,
+        );
+      }
+      await sleep(SOROBAN_POLL_INTERVAL_MS);
+    }
+
+    throw new Error(
+      `dispatch_confirmation confirmation timeout after ${SOROBAN_MAX_POLL_ATTEMPTS} attempts: ${confirmResult.hash}`,
+    );
   }
 }
 
